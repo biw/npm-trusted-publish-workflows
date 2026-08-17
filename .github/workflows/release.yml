@@ -1,0 +1,64 @@
+name: Release workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version in vMAJOR.MINOR.PATCH form (for example v1.0.0).
+        required: true
+        type: string
+      target:
+        description: Branch or commit to release.
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release target
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target }}
+          fetch-depth: 0
+
+      - name: Validate version and target
+        id: release
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v([1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version must use vMAJOR.MINOR.PATCH (for example v1.0.0)" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null; then
+            echo "Tag $VERSION already exists" >&2
+            exit 1
+          fi
+          echo "major=v${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "minor=v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ inputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+      - name: Update major and minor version tags
+        env:
+          MAJOR_TAG: ${{ steps.release.outputs.major }}
+          MINOR_TAG: ${{ steps.release.outputs.minor }}
+        run: |
+          for TAG in "$MAJOR_TAG" "$MINOR_TAG"; do
+            git tag --force -a "$TAG" -m "Move $TAG to ${{ inputs.version }}" "$GITHUB_SHA"
+            git push origin "refs/tags/$TAG" --force
+          done

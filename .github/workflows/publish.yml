@@ -1,0 +1,149 @@
+name: Publish package to npm
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version used to prepare and publish.
+        required: false
+        default: "24"
+        type: string
+      package-manager:
+        description: Package manager used to install dependencies and run package scripts (npm, yarn, or pnpm).
+        required: false
+        default: pnpm
+        type: string
+      working-directory:
+        description: Directory containing package.json.
+        required: false
+        default: "."
+        type: string
+      registry-url:
+        description: npm registry URL.
+        required: false
+        default: https://registry.npmjs.org
+        type: string
+      npm-access:
+        description: npm package access passed to `npm publish --access`.
+        required: false
+        default: public
+        type: string
+      create-release:
+        description: Create a GitHub release named after the package version.
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: npm-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: ${{ inputs.registry-url }}
+
+      - name: Read package version
+        id: package
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Validate package manager
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          case "$PACKAGE_MANAGER" in
+            npm|yarn|pnpm) ;;
+            *)
+              echo "package-manager must be one of: npm, yarn, pnpm" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        if: inputs.package-manager == 'pnpm'
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache npm dependencies
+        if: inputs.package-manager == 'npm'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ github.ref }}-${{ hashFiles(format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            ${{ runner.os }}-npm-${{ github.ref }}-
+            ${{ runner.os }}-npm-
+
+      - name: Cache pnpm dependencies
+        if: inputs.package-manager == 'pnpm'
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.path }}
+          key: ${{ runner.os }}-pnpm-${{ github.ref }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory)) }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-${{ github.ref }}-
+            ${{ runner.os }}-pnpm-
+
+      - name: Cache Yarn dependencies
+        if: inputs.package-manager == 'yarn'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ inputs.working-directory }}/.yarn/cache
+            ${{ inputs.working-directory }}/.yarn/install-state.gz
+          key: ${{ runner.os }}-yarn-${{ github.ref }}-${{ hashFiles(format('{0}/yarn.lock', inputs.working-directory)) }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-${{ github.ref }}-
+            ${{ runner.os }}-yarn-
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          case "$PACKAGE_MANAGER" in
+            npm) npm ci ;;
+            yarn) yarn install --immutable ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+          esac
+
+      - name: Run prepublish
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          "$PACKAGE_MANAGER" run prepublish
+
+      - name: Ensure recent npm for trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Publish to npm with provenance
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          NPM_ACCESS: ${{ inputs.npm-access }}
+          REGISTRY_URL: ${{ inputs.registry-url }}
+        run: npm publish --provenance --access "$NPM_ACCESS" --registry "$REGISTRY_URL"
+
+      - name: Create GitHub Release
+        if: inputs.create-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.package.outputs.version }}
+          name: v${{ steps.package.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true

@@ -1,0 +1,82 @@
+name: Check npm version
+
+on:
+  workflow_call:
+    inputs:
+      package-name:
+        description: Optional npm package name override. Defaults to the name in package.json.
+        required: false
+        default: ""
+        type: string
+      node-version:
+        description: Node.js version used for the check.
+        required: false
+        default: "24"
+        type: string
+      working-directory:
+        description: Directory containing package.json.
+        required: false
+        default: "."
+        type: string
+      registry-url:
+        description: npm registry URL.
+        required: false
+        default: https://registry.npmjs.org
+        type: string
+    outputs:
+      package_name:
+        description: npm package name read from package.json or the input override.
+        value: ${{ jobs.check.outputs.package_name }}
+      should_publish:
+        description: Whether the package version is not yet published to npm.
+        value: ${{ jobs.check.outputs.should_publish }}
+      version:
+        description: Version read from package.json.
+        value: ${{ jobs.check.outputs.version }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      package_name: ${{ steps.check.outputs.package_name }}
+      should_publish: ${{ steps.check.outputs.should_publish }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - id: check
+        name: Check whether the package version is published
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_NAME: ${{ inputs.package-name }}
+          REGISTRY_URL: ${{ inputs.registry-url }}
+        run: |
+          PACKAGE_NAME="${PACKAGE_NAME:-$(node -p "require('./package.json').name")}"
+          VERSION=$(node -p "require('./package.json').version")
+
+          if [ -z "$PACKAGE_NAME" ] || [ "$PACKAGE_NAME" = "undefined" ]; then
+            echo "package-name was not provided and package.json has no name" >&2
+            exit 1
+          fi
+
+          echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_VERSIONS=$(npm view "$PACKAGE_NAME" versions --json --registry "$REGISTRY_URL" 2>/dev/null || echo "[]")
+          if node -e '
+            const versions = JSON.parse(process.argv[1]);
+            const list = Array.isArray(versions) ? versions : [versions];
+            process.exit(list.includes(process.argv[2]) ? 0 : 1);
+          ' "$PUBLISHED_VERSIONS" "$VERSION"; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "$PACKAGE_NAME@$VERSION is already published."
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "$PACKAGE_NAME@$VERSION has not been published."
+          fi
