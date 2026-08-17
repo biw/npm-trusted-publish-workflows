@@ -58,6 +58,8 @@ jobs:
           MAJOR_TAG: ${{ steps.release.outputs.major }}
           MINOR_TAG: ${{ steps.release.outputs.minor }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for TAG in "$MAJOR_TAG" "$MINOR_TAG"; do
             git tag --force -a "$TAG" -m "Move $TAG to ${{ inputs.version }}" "$GITHUB_SHA"
             git push origin "refs/tags/$TAG" --force
