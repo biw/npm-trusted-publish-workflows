@@ -14,7 +14,7 @@ on:
 
 jobs:
   check:
-    uses: biw/npm-trusted-publish-action/.github/workflows/check.yml@v1
+    uses: biw/npm-trusted-publish-workflows/.github/workflows/check.yml@v1
 
   ci:
     needs: check
@@ -26,7 +26,7 @@ jobs:
     permissions:
       contents: write
       id-token: write
-    uses: biw/npm-trusted-publish-action/.github/workflows/publish.yml@v1
+    uses: biw/npm-trusted-publish-workflows/.github/workflows/publish.yml@v1
 ```
 
 `check` reads `package.json` and skips the rest of the chain when that version is already on npm. `publish` serializes publishes per repository, installs with pnpm by default, runs `prepublish`, then publishes with provenance and creates a GitHub Release.
