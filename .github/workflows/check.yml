@@ -11,7 +11,7 @@ on:
       node-version:
         description: Node.js version used for the check.
         required: false
-        default: "24"
+        default: "26"
         type: string
       working-directory:
         description: Directory containing package.json.
@@ -44,11 +44,15 @@ jobs:
       should_publish: ${{ steps.check.outputs.should_publish }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
 
       - id: check
         name: Check whether the package version is published
@@ -68,15 +72,24 @@ jobs:
           echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          PUBLISHED_VERSIONS=$(npm view "$PACKAGE_NAME" versions --json --registry "$REGISTRY_URL" 2>/dev/null || echo "[]")
-          if node -e '
-            const versions = JSON.parse(process.argv[1]);
+          if npm view "$PACKAGE_NAME" versions --json --registry "$REGISTRY_URL" > published-versions.json 2> npm-view-error.log; then
+            :
+          elif grep --quiet 'E404' npm-view-error.log; then
+            printf '[]\n' > published-versions.json
+          else
+            cat npm-view-error.log >&2
+            exit 1
+          fi
+
+          SHOULD_PUBLISH=$(node -e '
+            const versions = require("./published-versions.json");
             const list = Array.isArray(versions) ? versions : [versions];
-            process.exit(list.includes(process.argv[2]) ? 0 : 1);
-          ' "$PUBLISHED_VERSIONS" "$VERSION"; then
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            process.stdout.write(String(!list.includes(process.argv[1])));
+          ' "$VERSION")
+          echo "should_publish=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
+
+          if [ "$SHOULD_PUBLISH" = false ]; then
             echo "$PACKAGE_NAME@$VERSION is already published."
           else
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
             echo "$PACKAGE_NAME@$VERSION has not been published."
           fi
