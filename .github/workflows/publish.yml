@@ -6,7 +6,12 @@ on:
       node-version:
         description: Node.js version used to prepare and publish.
         required: false
-        default: "24"
+        default: "26"
+        type: string
+      tested-sha:
+        description: Commit tested by the caller's CI. Defaults to the calling workflow's commit.
+        required: false
+        default: ""
         type: string
       package-manager:
         description: Package manager used to install dependencies and run package scripts (npm, yarn, or pnpm).
@@ -34,32 +39,68 @@ on:
         default: true
         type: boolean
 
+permissions:
+  contents: read
+
 concurrency:
   group: npm-publish-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      published_sha: ${{ steps.revision.outputs.tested_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the CI-tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tested-sha || github.sha }}
+          # The read-only checkout credential permits fetching private repos too.
+          persist-credentials: true
 
-      - uses: actions/setup-node@v4
+      - name: Verify the tested revision is still main
+        id: revision
+        env:
+          TESTED_SHA: ${{ inputs.tested-sha || github.sha }}
+          CALLER_SHA: ${{ github.sha }}
+        run: |
+          if [[ ! "$TESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$TESTED_SHA" != "$CALLER_SHA" ]; then
+            echo "The tested commit must match the calling workflow's commit" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin refs/heads/main
+          if [ "$(git rev-parse HEAD)" != "$TESTED_SHA" ] || [ "$(git rev-parse FETCH_HEAD)" != "$TESTED_SHA" ]; then
+            echo "Refusing to publish a revision that is no longer the tip of main" >&2
+            exit 1
+          fi
+
+          echo "tested_sha=$TESTED_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ inputs.node-version }}
           registry-url: ${{ inputs.registry-url }}
+          package-manager-cache: false
 
-      - name: Read package version
+      - name: Read package version and lifecycle scripts
         id: package
         working-directory: ${{ inputs.working-directory }}
         run: |
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
-
-      - name: Enable Corepack
-        run: corepack enable
+          node -e '
+            const pkg = require("./package.json");
+            const scripts = pkg.scripts ?? {};
+            const legacy = !scripts.prepublishOnly && scripts.prepublish ? "prepublish" : "";
+            console.log("version=" + pkg.version);
+            console.log("legacy_script=" + legacy);
+          ' >> "$GITHUB_OUTPUT"
 
       - name: Validate package manager
         env:
@@ -73,42 +114,11 @@ jobs:
               ;;
           esac
 
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        if: inputs.package-manager == 'pnpm'
-        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache npm dependencies
-        if: inputs.package-manager == 'npm'
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-${{ github.ref }}-${{ hashFiles(format('{0}/package-lock.json', inputs.working-directory)) }}
-          restore-keys: |
-            ${{ runner.os }}-npm-${{ github.ref }}-
-            ${{ runner.os }}-npm-
-
-      - name: Cache pnpm dependencies
-        if: inputs.package-manager == 'pnpm'
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pnpm-cache.outputs.path }}
-          key: ${{ runner.os }}-pnpm-${{ github.ref }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory)) }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-${{ github.ref }}-
-            ${{ runner.os }}-pnpm-
-
-      - name: Cache Yarn dependencies
-        if: inputs.package-manager == 'yarn'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ inputs.working-directory }}/.yarn/cache
-            ${{ inputs.working-directory }}/.yarn/install-state.gz
-          key: ${{ runner.os }}-yarn-${{ github.ref }}-${{ hashFiles(format('{0}/yarn.lock', inputs.working-directory)) }}
-          restore-keys: |
-            ${{ runner.os }}-yarn-${{ github.ref }}-
-            ${{ runner.os }}-yarn-
+      - name: Install Corepack for pnpm and Yarn
+        if: inputs.package-manager != 'npm'
+        run: |
+          npm install --global corepack@0.36.0
+          corepack enable
 
       - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
@@ -121,7 +131,10 @@ jobs:
             pnpm) pnpm install --frozen-lockfile ;;
           esac
 
-      - name: Run prepublish
+      # npm publish invokes prepublishOnly itself. Preserve older packages that
+      # use prepublish, without executing prepublishOnly twice.
+      - name: Run legacy prepublish
+        if: steps.package.outputs.legacy_script != ''
         working-directory: ${{ inputs.working-directory }}
         env:
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
@@ -129,7 +142,17 @@ jobs:
           "$PACKAGE_MANAGER" run prepublish
 
       - name: Ensure recent npm for trusted publishing
-        run: npm install -g npm@latest
+        run: npm install --global npm@11.21.0
+
+      - name: Reconfirm the published revision
+        env:
+          TESTED_SHA: ${{ steps.revision.outputs.tested_sha }}
+        run: |
+          git fetch --no-tags origin refs/heads/main
+          if [ "$(git rev-parse HEAD)" != "$TESTED_SHA" ] || [ "$(git rev-parse FETCH_HEAD)" != "$TESTED_SHA" ]; then
+            echo "Refusing to publish a revision that is no longer the tip of main" >&2
+            exit 1
+          fi
 
       - name: Publish to npm with provenance
         working-directory: ${{ inputs.working-directory }}
@@ -138,12 +161,19 @@ jobs:
           REGISTRY_URL: ${{ inputs.registry-url }}
         run: npm publish --provenance --access "$NPM_ACCESS" --registry "$REGISTRY_URL"
 
+  release:
+    needs: publish
+    if: inputs.create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - name: Create GitHub Release
-        if: inputs.create-release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          tag_name: v${{ steps.package.outputs.version }}
-          name: v${{ steps.package.outputs.version }}
+          tag_name: v${{ needs.publish.outputs.version }}
+          name: v${{ needs.publish.outputs.version }}
+          target_commitish: ${{ needs.publish.outputs.published_sha }}
           draft: false
           prerelease: false
           generate_release_notes: true
